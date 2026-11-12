@@ -1,0 +1,97 @@
+# Contributing to Fullsend
+
+Thank you for your interest in contributing! This document covers the social norms and processes we follow.
+
+**Adding a new configuration option to an agent?** See [FEATURES.md](FEATURES.md) for the full checklist.
+
+**Running agents locally?** See [LOCAL.md](LOCAL.md) for setup and testing instructions.
+
+## First-Time Contributors
+
+This project uses a **vouch system**. AI tools make it trivial to generate plausible-looking but low-quality contributions, so we require first-time contributors to be vouched by a maintainer before submitting pull requests.
+
+1. Open a [Vouch Request](https://github.com/fullsend-ai/fullsend/discussions/new?category=vouch-request) discussion on the main fullsend repo.
+2. Describe what you want to change and why.
+3. Write in your own words — do not have an AI generate the request. Requests that read like LLM output will be denied.
+4. A maintainer will comment `/vouch` if approved.
+5. Once vouched, you can submit pull requests to any repo in the fullsend-ai org.
+
+**If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with write access bypass this check.
+
+## Commit messages
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/). See [COMMITS.md](COMMITS.md) for the full specification, type selection rules, and examples.
+
+## DCO (Developer Certificate of Origin)
+
+This project uses the [Probot DCO app](https://github.com/apps/dco) to enforce sign-off on commits. A local `commit-msg` hook configured in `.pre-commit-config.yaml` (`.github/scripts/check-dco-signoff.sh`) also validates that human commits include a matching `Signed-off-by` trailer before push.
+
+- **Human contributors and human-driven agent sessions:** Add `Signed-off-by` to your commits with `git commit -s`. The human directing the session is the one certifying the DCO, just as they would for any other commit.
+- **Autonomous agents: do NOT add `Signed-off-by` trailers.** Do not use `git commit -s` and do not manually append a `Signed-off-by` line. Your commits are exempt — see below.
+
+**Why autonomous agents are exempt.** The DCO is a human attestation — it certifies personhood and legal authority to contribute. No one is present to make that certification in an autonomous session. The fullsend agents commit using the GitHub App's bot identity (`<id>+<slug>[bot]@users.noreply.github.com`), which GitHub recognizes as `author.type: "Bot"`. Both the Probot DCO app and the local `commit-msg` hook auto-skip bot-authored commits. The human who merges an agent PR accepts responsibility for the contribution.
+
+**Installing the local commit-msg hook.** Run `pre-commit install` (or `pre-commit install --hook-type commit-msg`) to activate the hook locally. Note that `pre-commit run --all-files` only runs hooks in the `pre-commit` stage; git hooks must be installed via `pre-commit install` to run during `git commit`.
+
+## Pull request workflow
+
+### Opening a PR
+
+- Stage your changes and fix any lint failures before pushing. CI runs two independent checks: `pre-commit run --all-files` (actionlint, gitleaks, shellcheck, pinact, YAML/JSON checks) and `make lint` (skillsaw). Run both locally before pushing; `make lint-fix` applies skillsaw's automatic fixes.
+- If `make lint` fails because unrelated changes on `main` increased an existing baselined violation, merge `main` and run `make lint-baseline`. Do not regenerate the baseline for violations introduced or increased by your PR; fix those instead.
+- Keep PRs focused. One problem area or decision per PR is easier to review than a grab-bag.
+- **If your PR introduces a breaking change**, the PR title must carry the `!` suffix (e.g., `feat(harness)!: require role field`). See [COMMITS.md](COMMITS.md#breaking-changes) for how to identify breaking changes and what to include in the commit body.
+
+### Review etiquette
+
+- **Comment resolution belongs to the PR author.** When a reviewer leaves a comment, the PR author is free to address the feedback and resolve the conversation themselves. This keeps the review cycle moving.
+- **If you need to block a PR on your feedback, use "Request changes."** A comment alone is advisory — the author may resolve it at their discretion. The "Request changes" review status is how a reviewer signals that the PR should not merge until their concern is addressed. This is the only mechanism for enforcing your review.
+- **Be constructive.** Disagreement is expected and valuable. Critique ideas, not people. When you push back on a proposal, suggest an alternative or explain what concern drives your objection.
+
+### Reworking a PR
+
+When a PR needs a significant change in approach — not just addressing review feedback, but rethinking the implementation or design — close the existing PR with a comment explaining why, and open a new one. Link the new PR to the old one for historical continuity. This is preferred over force-pushing because:
+
+- Reviewers see a fresh PR in their queue instead of missing that the content changed completely.
+- The closed PR preserves the original discussion and the reasoning behind the pivot.
+- Metrics can track rework cycles accurately.
+
+Small adjustments in response to review feedback are normal iteration — this guideline applies when the underlying approach changes.
+
+### Functional tests for external contributors
+
+Functional tests (the `Functional Tests` and `Behaviour Tests` workflows) run
+automatically for same-repository pull requests authored by users with
+**write access or higher** (`write`, `maintain`, or `admin`).
+
+They need `/ok-to-test <sha>` for:
+
+- contributors without write access (including those with read or triage
+  roles);
+- any pull request from a fork, **including one whose author has write
+  access**: `pull_request` runs from forks get no secrets.
+
+Someone with write access reviews the latest push and comments on the PR:
+
+```text
+/ok-to-test <full 40-character sha of the latest push>
+```
+
+The comment's first line must be `/ok-to-test` and the full sha; a short
+prefix is refused. The tests run only when that sha is still the PR head, and
+the `functional-tests-complete` and `behaviour` checks report on that commit.
+**A later push needs a new comment** naming the new head. The `ok-to-test`
+label no longer starts a run.
+
+This is a separate gate from GitHub's own first-time-contributor
+workflow-approval prompt (the "Approve and run workflows" button). Approving
+that prompt lets `pull_request`-triggered workflows start, but a fork PR's
+functional tests still need `/ok-to-test <sha>`.
+
+### Merging
+
+- PRs require approval from a maintainer before merging.
+
+## License
+
+All contributions to this project are made under the [Apache License, Version 2.0](LICENSE). By submitting a pull request, you agree that your contributions will be licensed under this license.

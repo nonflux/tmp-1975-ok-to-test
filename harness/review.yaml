@@ -1,0 +1,164 @@
+---
+agent: agents/review.md
+doc: docs/review.md
+model: opus
+# Reasoning effort (low|medium|high|xhigh|max), pinned to what the fleet
+# already ran at implicitly: Claude Code's default effort is high on every
+# effort-capable model except Opus 4.7 (xhigh) — code.claude.com/docs/en/
+# model-config — and the fullsend pi runtime passes --thinking high when
+# effort is unset (internal/runtime/pi_run.go piDefaultThinking). Revisit
+# when the model: above moves to a generation with a different default.
+effort: high
+image: ghcr.io/fullsend-ai/fullsend-code@sha256:6961dc3cf51abbb94291dea02c8d69a7aa33df1f146c6ae5c33304b27eb2203e
+policy: policies/base.yaml
+readonly_repo: true
+providers:
+  - vertex-ai
+  - openai
+
+role: review
+slug: fullsend-ai-review
+
+# CEL dispatch trigger (docs/guides/user/cel-triggers-reference.md in
+# fullsend). Matches the event selection of the review routing in fullsend's
+# reusable-dispatch.yml: a PR opened, pushed to, or marked ready; the
+# ready-for-review label added to a PR, by a human or a bot; or a /fs-review
+# comment from a human on a PR/MR. GitLab dispatch only emits MR opened and
+# MR notes, so on GitLab this fires on MR opened and /fs-review only.
+# Authorization stays with the platform gate, so this expression has no role
+# checks; who may trigger a review differs from the dispatch workflow until
+# the gate's per-harness threshold lands. A GitHub PR comment arrives as a
+# work_item with entity.linked_change_proposal set; state.change_proposal is
+# absent there when the PR lookup fails, so it is not used as the PR signal.
+# harness/triggertest/trigger_test.go evaluates this against the
+# NormalizedEvent fixtures.
+trigger: >
+  (event.entity.kind == "change_proposal"
+    && event.transition.kind in ["opened", "synchronized", "marked_ready"])
+  || (event.entity.kind == "change_proposal"
+    && event.transition.kind == "label_changed"
+    && event.transition.label.name == "ready-for-review"
+    && event.transition.label.action == "added")
+  || (event.transition.kind == "comment_added"
+    && has(event.transition.comment.command)
+    && event.transition.comment.command == "/fs-review"
+    && event.actor.kind == "human"
+    && (event.entity.kind == "change_proposal"
+        || has(event.entity.linked_change_proposal)))
+
+skills:
+  - skills/pr-review
+  - skills/code-review
+  - skills/docs-review
+  - skills/pr-risk-assessment
+
+host_files:
+  - src: env/gcp-vertex.env
+    dest: /sandbox/workspace/.env.d/gcp-vertex.env
+    expand: true
+  - src: ${GOOGLE_APPLICATION_CREDENTIALS}
+    dest: /tmp/.gcp-credentials.json
+    optional: true
+  - src: ${GCP_OIDC_TOKEN_FILE}
+    dest: /sandbox/workspace/.gcp-oidc-token
+    optional: true
+  - src: ${PRIOR_REVIEW_FILE}
+    dest: /sandbox/workspace/prior-review.txt
+    optional: true
+
+pre_script: scripts/pre-review.sh
+post_script: scripts/post-review.sh
+
+validation_loop:
+  script: scripts/validate-output-schema.sh
+  preflight_check: 'python3 -c "import jsonschema"'
+  schema: schemas/review-result.schema.json
+  # Interim, pending fullsend-ai/fullsend#7042: the runner cannot tell a
+  # timeout from a schema failure, so a second iteration replays a killed
+  # review from scratch. Restore 2 with `feedback_mode: append` then.
+  max_iterations: 1
+
+env:
+  # REVIEW_FINDING_SEVERITY_THRESHOLD and REVIEW_PROTECTED_PATHS are set
+  # independently for runner and sandbox — they're allowed to differ, but
+  # if they do, findings/enforcement may be inconsistent between the
+  # agent's own output and the post-script's defense-in-depth filter.
+  # Best practice is to keep them in sync. Repos needing different values
+  # override these keys via harness `base:` composition.
+  runner:
+    REVIEW_FINDING_SEVERITY_THRESHOLD: "low"
+    REVIEW_PROTECTED_PATHS: ".claude/,.cursor/,.pi/,.gitattributes,.gitignore,.github/,.pre-commit-config.yaml,AGENTS.md,agents/,api-servers/,CLAUDE.md,CODEOWNERS,Containerfile,Dockerfile,harness/,images/,plugins/,policies/,profiles/,providers/,scripts/,skills/"
+    REPO_FULL_NAME: "${REPO_FULL_NAME}"
+  sandbox:
+    REVIEW_FINDING_SEVERITY_THRESHOLD: "low"
+    REVIEW_PROTECTED_PATHS: ".claude/,.cursor/,.pi/,.gitattributes,.gitignore,.github/,.pre-commit-config.yaml,AGENTS.md,agents/,api-servers/,CLAUDE.md,CODEOWNERS,Containerfile,Dockerfile,harness/,images/,plugins/,policies/,profiles/,providers/,scripts/,skills/"
+    REPO_FULL_NAME: "${REPO_FULL_NAME}"
+    PRIOR_REVIEW_SHA: "${PRIOR_REVIEW_SHA}"
+    PRIOR_REVIEW_PROVENANCE: "${PRIOR_REVIEW_PROVENANCE}"
+    # Mirror of timeout_minutes (the code/fix convention); the pr-review
+    # skill budgets its tail from it. Keep the two in sync.
+    TIMEOUT_SECONDS: "2700"
+
+# Per iteration. The pipeline has a ~13–18 minute floor independent of
+# PR size; 20 sat on it. Mirrored as TIMEOUT_SECONDS in env.sandbox.
+timeout_minutes: 45
+
+forge:
+  github:
+    providers:
+      - github-ro
+      - providers/github-public-ro.yaml
+    openshell:
+      profiles:
+        - profiles/fullsend-github-public-ro.yaml
+    skills:
+      - skills/github-forge
+      - skills/issue-labels/github
+      - skills/pr-review/github
+    host_files:
+      - src: env/github/review.env
+        dest: /sandbox/workspace/.env.d/review.env
+        expand: true
+    env:
+      runner:
+        REVIEW_TOKEN: "${REVIEW_TOKEN}"
+        PR_NUMBER: "${PR_NUMBER}"
+        PR_URL: "${GITHUB_PR_URL}"
+        GH_TOKEN: "${GH_TOKEN}"
+        FULLSEND_FORGE: github
+        FULLSEND_APP_SET: "${FULLSEND_APP_SET}"
+        REVIEW_RISK_ASSESSMENT_ENABLED: "true"
+        REVIEW_RISK_VERDICT_THRESHOLD: "4"
+      sandbox:
+        PR_NUMBER: "${PR_NUMBER}"
+        PR_URL: "${GITHUB_PR_URL}"
+        FULLSEND_FORGE: github
+        REVIEW_RISK_ASSESSMENT_ENABLED: "true"
+        REVIEW_RISK_VERDICT_THRESHOLD: "4"
+  gitlab:
+    providers:
+      - providers/gitlab-ro.yaml
+      - providers/github-public-ro.yaml
+    openshell:
+      profiles:
+        - profiles/fullsend-gitlab-ro.yaml
+        - profiles/fullsend-github-public-ro.yaml
+    skills:
+      - skills/gitlab-forge
+      - skills/issue-labels/gitlab
+      - skills/pr-review/gitlab
+    host_files:
+      - src: env/gitlab/review.env
+        dest: /sandbox/workspace/.env.d/review.env
+        expand: true
+    env:
+      runner:
+        REVIEW_TOKEN: "${GITLAB_TOKEN}"
+        PR_NUMBER: "${MR_NUMBER}"
+        PR_URL: "${GITLAB_MR_URL}"
+        GITLAB_TOKEN: "${GITLAB_TOKEN}"
+        FULLSEND_FORGE: gitlab
+      sandbox:
+        PR_NUMBER: "${MR_NUMBER}"
+        PR_URL: "${GITLAB_MR_URL}"
+        FULLSEND_FORGE: gitlab

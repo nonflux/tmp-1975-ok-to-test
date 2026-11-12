@@ -1,0 +1,306 @@
+name: Functional Tests
+# Same-repo PRs run on pull_request (secrets available; the gate job
+# authorizes the author before detect/functional-tests check out PR head).
+# Fork PRs get no secrets on pull_request: the suites skip until a writer
+# comments `/ok-to-test <sha>`, and ok-to-test.yml calls this workflow for
+# that sha (event_name issue_comment, inputs.head_sha). No
+# pull_request_target: GitHub blocks it by default from 2026-12-02 (#1975).
+#
+# Each change runs the full tier once, in the merge queue, on the commit that
+# lands. PR runs use the release tier (one release:true case per agent)
+# unless the PR carries the eval-full label. Applying eval-full does not
+# start a run by itself; it applies from the next push or /ok-to-test run. There is no push-to-main run:
+# the merge queue already tested that merge commit, and the nightly
+# (functional-tests-nightly.yml) runs the full tier for every agent.
+permissions: {}
+on:
+  pull_request:
+    # Fork PRs: /ok-to-test is handled by ok-to-test.yml via workflow_call.
+    types: [opened, synchronize, reopened]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Eval tier: auto (script default), full or release'
+        required: false
+        type: choice
+        options: [auto, full, release]
+        default: auto
+  workflow_call:
+    inputs:
+      fullsend_ref:
+        description: 'fullsend ref to build from (main or release tag v*)'
+        required: false
+        type: string
+        default: main
+      tier:
+        # Empty keeps eval/run-functional.sh's caller-derived default
+        # (release for a cross-repo call), so callers that omit it -- and
+        # callers pinned to an older copy of this workflow -- behave the same.
+        description: "Eval tier: '' or auto (script default), full or release"
+        required: false
+        type: string
+        default: ''
+      # Set only by ok-to-test.yml in this repo, from an authorized
+      # /ok-to-test comment; fullsend's release.yml leaves them empty.
+      pr_number:
+        description: Pull request number the /ok-to-test comment authorized
+        required: false
+        type: string
+        default: ''
+      head_sha:
+        description: PR head sha the /ok-to-test comment authorized (checked out by the tests)
+        required: false
+        type: string
+        default: ''
+    secrets:
+      E2E_GCP_WIF_PROVIDER:
+        required: false
+      E2E_GCP_SERVICE_ACCOUNT:
+        required: false
+      E2E_GCP_PROJECT_ID:
+        required: false
+      EVAL_GH_TOKEN:
+        required: false
+    outputs:
+      agents_sha:
+        description: 'Resolved commit SHA of the agents checkout (for cross-repo tagging)'
+        value: ${{ jobs.detect.outputs.agents_sha }}
+      result:
+        description: 'functional-tests-complete job status (success or failure); read by ok-to-test.yml'
+        value: ${{ jobs.functional-tests-complete.outputs.result }}
+# In a called workflow github.workflow is the caller's name, so /ok-to-test
+# runs need their own group: behaviour-tests.yml is called from the same
+# caller run and would otherwise share (and deadlock on) one group. They are
+# never cancelled; the caller reports their result.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request'
+
+        && format('functional-{0}', github.event.pull_request.number)
+        || github.repository != 'nonflux/tmp-1975-ok-to-test'
+        && format('functional-call-{0}', github.run_id)
+        || github.event_name == 'issue_comment'
+        && format('functional-ok-to-test-{0}', inputs.pr_number)
+        || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request'
+
+        || (github.event_name != 'issue_comment' && github.ref != 'refs/heads/main') }}
+jobs:
+  gate:
+    # Separate job so pull-requests: write stays out of the job that checks
+    # out fork head and runs tests with secrets.
+    # Never checkout github.event.pull_request.head.sha here.
+    # Same-repo PRs only (gh-aw's guard): a fork PR's pull_request token is
+    # read-only and it gets no secrets, so forks go through /ok-to-test.
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.head.repo.id == github.repository_id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      authorized: ${{ steps.auth.outputs.authorized }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }} # Base only — never checkout PR head in gate
+          persist-credentials: false
+      - name: Check PR authorization
+        id: auth
+        uses: ./.github/actions/check-e2e-authorization
+        with:
+          pr_number: ${{ github.event.pull_request.number }}
+          repository: ${{ github.repository }}
+          pr_updated_at: ${{ github.event.pull_request.updated_at }}
+          event_action: ${{ github.event.action }}
+          pr_author_association: ${{ github.event.pull_request.author_association }}
+          pr_author_login: ${{ github.event.pull_request.user.login }}
+          label_actor_login: ${{ github.event.sender.login }}
+  # ---------------------------------------------------------------------------
+  # Detect which agents need functional testing based on changed files.
+  # Lightweight job: checkout + yq + select-eval-agents.sh → JSON array.
+  # ---------------------------------------------------------------------------
+  detect:
+    needs: gate
+    if: >-
+      !cancelled() && github.repository_owner == 'nonflux' && (github.event_name != 'pull_request' || needs.gate.outputs.authorized == 'true') && (github.event_name != 'issue_comment' || inputs.head_sha != '')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      agents: ${{ steps.agents.outputs.agents }}
+      agents_sha: ${{ steps.checkout.outputs.commit }}
+    steps:
+      - name: Get changed files
+        id: changes
+        if: >-
+          github.repository == 'nonflux/tmp-1975-ok-to-test' && (github.event_name == 'pull_request' ||
+
+           github.event_name == 'issue_comment' ||
+           github.event_name == 'merge_group')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+          # /ok-to-test runs: diff the authorized sha, not whatever the PR head is now.
+          HEAD_SHA: ${{ inputs.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$EVENT_NAME" = "merge_group" ] || [ "$EVENT_NAME" = "issue_comment" ]; then
+            if [ "$EVENT_NAME" = "merge_group" ]; then
+              RANGE="${MERGE_GROUP_BASE}...${MERGE_GROUP_HEAD}"
+            else
+              RANGE="${DEFAULT_BRANCH}...${HEAD_SHA}"
+            fi
+            FILES=$(gh api "repos/${REPO}/compare/${RANGE}" --jq '.files[].filename') || {
+              echo "::warning::Failed to fetch ${EVENT_NAME} files — running all functional tests as a precaution"
+              exit 0
+            }
+            FILE_COUNT=$(echo "$FILES" | wc -l)
+            if [ "$FILE_COUNT" -ge 300 ]; then
+              echo "::warning::Compare API returned $FILE_COUNT files (possible truncation at 300) — running all functional tests as a precaution"
+              exit 0
+            fi
+          else
+            FILES=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename') || {
+              echo "::warning::Failed to fetch PR files — running all functional tests as a precaution"
+              exit 0
+            }
+            FILE_COUNT=$(echo "$FILES" | wc -l)
+            if [ "$FILE_COUNT" -ge 300 ]; then
+              echo "::warning::PR file list returned $FILE_COUNT files (possible truncation) — running all functional tests as a precaution"
+              exit 0
+            fi
+          fi
+          DELIM="ghadelim_$(openssl rand -hex 8)"
+          {
+            echo "files<<${DELIM}"
+            echo "$FILES"
+            echo "${DELIM}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        id: checkout
+        with:
+          repository: ${{ github.repository != 'nonflux/tmp-1975-ok-to-test' && 'nonflux/tmp-1975-ok-to-test' || github.repository }}
+          ref: >-
+            ${{ github.repository != 'nonflux/tmp-1975-ok-to-test'
+
+                && 'main'
+                || (github.event_name == 'pull_request'
+                    && github.event.pull_request.head.sha
+                    || github.event_name == 'issue_comment' && inputs.head_sha
+                    || github.sha) }}
+          persist-credentials: false
+          # Fork code only after a writer's /ok-to-test for this exact sha.
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'issue_comment' }}
+      - name: Install yq
+        run: |
+          curl -sSfL "https://github.com/mikefarah/yq/releases/download/v4.47.1/yq_linux_amd64" -o /usr/local/bin/yq
+          echo "0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb  /usr/local/bin/yq" | sha256sum -c
+          chmod +x /usr/local/bin/yq
+      - name: Select eval agents
+        id: agents
+        env:
+          CHANGED_FILES: ${{ steps.changes.outputs.files }}
+        run: |
+          if [ -n "$CHANGED_FILES" ]; then
+            AGENTS=$(echo "$CHANGED_FILES" | bash .github/scripts/select-eval-agents.sh)
+          else
+            # No diff (dispatch, workflow_call, or a failed diff fetch): run all
+            # agents with eval configs
+            AGENTS=$(for d in eval/*/eval.yaml; do basename "$(dirname "$d")"; done)
+          fi
+          JSON=$(echo "$AGENTS" | jq -Rsc '[split("\n")[] | select(length > 0)]')
+          echo "agents=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Selected agents: $JSON"
+  # ---------------------------------------------------------------------------
+  # Run functional tests — one matrix leg per agent, in parallel.
+  # Each leg does full setup (python, fullsend, podman, etc.) independently.
+  # ---------------------------------------------------------------------------
+  functional-tests:
+    needs: [gate, detect]
+    if: >-
+      !cancelled() && github.repository_owner == 'nonflux' && needs.detect.outputs.agents != '[]' && (github.event_name != 'pull_request' || needs.gate.outputs.authorized == 'true') && (github.event_name != 'issue_comment' || inputs.head_sha != '')
+    runs-on: ubuntu-24.04
+    # The full-tier review leg takes 39-43 min (9 live cases); 60 leaves
+    # headroom. The release tier runs one case per agent.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJSON(needs.detect.outputs.agents) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.repository != 'nonflux/tmp-1975-ok-to-test' && 'nonflux/tmp-1975-ok-to-test' || github.repository }}
+          ref: >-
+            ${{ github.repository != 'nonflux/tmp-1975-ok-to-test'
+
+                && (needs.detect.outputs.agents_sha || 'main')
+                || (github.event_name == 'pull_request'
+                    && github.event.pull_request.head.sha
+                    || github.event_name == 'issue_comment' && inputs.head_sha
+                    || github.sha) }}
+          persist-credentials: false
+          # Fork code only after a writer's /ok-to-test for this exact sha.
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'issue_comment' }}
+          submodules: true
+      - name: Stub suite
+        run: echo "functional ${AGENT} ran on $(git rev-parse HEAD)"
+        env:
+          AGENT: ${{ matrix.agent }}
+  # ---------------------------------------------------------------------------
+  # Roll-up job with a stable name for branch protection required checks.
+  # Require "functional-tests-complete" in repo settings — it handles all
+  # dynamic matrix shapes including empty (no agents to test).
+  # ---------------------------------------------------------------------------
+  functional-tests-complete:
+    needs: [gate, detect, functional-tests]
+    # Always runs, so every PR head gets a verdict: a fork PR's skipped
+    # detect fails here until a writer comments /ok-to-test <sha>.
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.result.outputs.result }}
+    steps:
+      # Base branch only -- a PR must not be able to rewrite this script
+      # to force-pass its own roll-up check.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.repository != 'nonflux/tmp-1975-ok-to-test' && 'nonflux/tmp-1975-ok-to-test' || github.repository }}
+          ref: >-
+            ${{ github.repository != 'nonflux/tmp-1975-ok-to-test'
+
+                && (needs.detect.outputs.agents_sha || 'main')
+                || github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Check results
+        id: result
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          DETECT_RESULT: ${{ needs.detect.result }}
+          TESTS_RESULT: ${{ needs.functional-tests.result }}
+          CROSS_REPO: ${{ github.repository != 'nonflux/tmp-1975-ok-to-test' }}
+        run: |
+          if bash .github/scripts/check-rollup-result.sh; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi

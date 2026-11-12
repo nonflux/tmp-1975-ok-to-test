@@ -1,0 +1,134 @@
+# Retro Agent
+
+![Retro agent icon](icons/retro.png)
+
+Performs retrospectives on agent workflows — analyzes what happened, identifies improvement opportunities, and proposes changes as issues.
+
+## Setup
+
+No additional setup is required beyond the standard fullsend configuration.
+
+## How it helps
+
+- Every workflow gets a post-mortem, not just the ones that failed badly enough for someone to notice.
+- Improvement proposals are filed as issues with context, so they enter the normal triage/prioritize pipeline.
+- Patterns across multiple retros surface systemic issues (e.g., a skill that consistently underperforms).
+
+## Triggers
+
+The retro agent runs automatically when a PR is closed (merged or not).
+
+It can also be triggered manually with the `/fs-retro` command.
+
+The harness also declares a CEL `trigger:` for fullsend's harness dispatch that selects the same events on GitHub: a PR closed (merged or not), or a `/fs-retro` comment from a human on an issue or PR. Dispatch does not evaluate it for the built-in retro agent yet, so the routing above is what runs today.
+
+## Commands
+
+| Command | Where | Effect |
+|---------|-------|--------|
+| `/fs-retro` | PR or issue comment | Triggers a retrospective analysis |
+
+Requires write-level repository permission (admin, maintain, or write).
+
+The `/fs-retro` command accepts optional free-text instructions after the
+command. The text is passed to the agent as high-signal direction about what
+to focus on:
+
+- `/fs-retro` — general retrospective on the workflow
+- `/fs-retro figure out why the review agent approved this and make sure it never happens again`
+- `/fs-retro the code agent spent 30 minutes on a 2-line fix, what went wrong`
+
+## Control labels
+
+| Label | Meaning |
+|-------|---------|
+| `ready-for-triage` | Applied to proposal issues so they enter the [triage](triage.md) pipeline automatically. |
+
+## Configuration
+
+See [Customizing with AGENTS.md](https://fullsend.sh/docs/guides/user/customizing-with-agents-md) and
+[Customizing with Skills](https://fullsend.sh/docs/guides/user/customizing-with-skills).
+
+### Variables
+
+| Variable | Description | Default | Valid values |
+|----------|-------------|---------|--------------|
+| `FULLSEND_FORGE` | Forge platform. Set automatically by the harness `forge.<platform>.env` section. | (set by harness) | `"github"`, `"gitlab"` |
+
+### Issue filing allowlist
+
+Cross-repo issue creation is governed by `tracker.<provider>.allowed_targets`
+in `config.yaml` — the same allowlist used by the [triage agent](triage.md)
+for prerequisite issues. The post-script honors the targets of the
+`tracker` provider block that matches `FULLSEND_FORGE`:
+`tracker.github.allowed_targets.orgs` and `repos` on GitHub, or
+`tracker.gitlab.allowed_targets.groups` and `repos` on GitLab (a group
+also covers its subgroups' projects). A `tracker` mapping for another
+provider, or one with more than one provider block, grants no cross-repo
+targets (the post-script logs a warning naming the providers it found).
+The former `create_issues.allow_targets` key is no longer read and logs a
+warning if present; move `orgs` and `repos` to
+`tracker.github.allowed_targets`, or `repos` to
+`tracker.gitlab.allowed_targets` (with `groups` for group-wide access).
+Proposals targeting repos outside the allowlist are skipped with a warning
+and surfaced in the summary comment so they can be filed manually.
+
+A configuration preset (`config.base.yaml`, beside `config.yaml`) is
+composed beneath the overlay with fullsend's whole-object `tracker` merge:
+an overlay without `tracker` (or with a null or bare `tracker:`) inherits
+the base's targets, and an overlay that sets `tracker` (including an
+explicit empty target policy) replaces them. A null or bare `tracker:` that
+inherits base targets prints a warning; to revoke them, set an explicit empty
+`allowed_targets` instead. If either file cannot be parsed, cross-repo issue
+creation is disabled with a warning.
+
+The originating repo (where the PR that triggered the retro lives) is
+always implicitly allowed.
+
+## Multi-forge support
+
+The retro agent supports both GitHub and GitLab. The harness
+`forge.<platform>` sections configure platform-specific policies,
+skills, env vars, and providers. Key differences from single-forge
+setup:
+
+- **`FULLSEND_FORGE`** is required. Set automatically by the harness
+  `forge.<platform>.env` section (`"github"` or `"gitlab"`).
+- **Policy** is `policies/base.yaml` for all forges. Network access is
+  provided by profiles (`fullsend-gitlab-ro` for GitLab).
+- **GitLab uses `curl`** instead of `gh` for API access. The GitLab
+  profile (`fullsend-gitlab-ro`) allows `curl` for GitLab API
+  endpoints only.
+- **GitLab host validation** — `forge_validate_originating_url`
+  validates the host against `CI_SERVER_HOST`, a GitLab CI predefined
+  variable set automatically by the runner. Validation fails closed
+  when `CI_SERVER_HOST` is not set. The GitLab profile in
+  `profiles/fullsend-gitlab-ro.yaml` must also be updated.
+
+## How the agent works
+
+The retro agent reconstructs the full workflow graph — [triage](triage.md), [code](code.md), [review](review.md), [fix](fix.md), and human interactions — by fetching issue and PR timelines, agent run logs, and review threads.
+
+1. **Pre-script** gathers metadata about the originating PR or issue.
+2. **Sandbox** — the agent reads the full workflow history, identifies patterns (wasted cycles, missed context, repeated failures), and writes structured proposals. It uses the retro-analysis and finding-agent-runs skills. The agent cannot write files or edit code in the target repo.
+3. **Validation loop** — output is checked against a schema, with up to 2 retries.
+4. **Post-script** creates issues from the agent's proposals. Proposals whose titles match evidence-for patterns (e.g. "Evidence for #1234: ...") are filtered out and folded into the summary comment as evidence notes instead of being filed as issues.
+
+When triggered via `/fs-retro`, the human's comment is passed to the agent as high-signal direction about what to focus on.
+
+## Custom network policy
+
+If this agent needs to reach hosts beyond the defaults, see the
+[custom network policy guide](network-policy.md).
+
+## Runtime support
+
+Supported runtimes: **claude** (stable default), **pi** (experimental). On pi, sub-agents run with the agent model, see [Fullsend pi docs](https://fullsend.sh/docs/runtimes/pi) on how to define a different model for sub-agents.
+
+**Codex** is not a supported runtime for retro yet. Retro dispatches native Codex children only when the runtime note lists registered sub-agent roles, which depends on [fullsend #6970](https://github.com/fullsend-ai/fullsend/issues/6970); this section changes after a live retro run on Codex is linked here. Retro passes no `model`: the runner binds each child's model from `agents[].subagents`, or its run-level default.
+
+Effort: `high` (explicit in the harness; override per run with `fullsend run --effort` or `FULLSEND_EFFORT`, values `low`–`max`).
+
+## Source
+
+[`harness/retro.yaml`](https://github.com/fullsend-ai/agents/blob/main/harness/retro.yaml)

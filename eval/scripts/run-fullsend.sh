@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# CLI runner command for the eval harness.
+#
+# Called by the harness as the runner.command. Setup and teardown are
+# handled by before_each/after_each hooks — this script just runs
+# fullsend with the right env vars.
+#
+# Args (from harness placeholders):
+#   $1 — agent name (e.g., "triage")
+#   $2 — workspace path (case workspace)
+#   $3 — output directory
+#
+# Required env (injected by harness from hook outputs + execution.env):
+#   FULLSEND_DIR    — path to the fullsend scaffold directory
+#   GH_TOKEN        — GitHub token
+#   FIXTURE_URL     — URL of the fixture (issue or PR)
+#   FIXTURE_TYPE    — "issue" or "pull_request"
+#
+# Optional env:
+#   EVAL_RUNTIME / EVAL_MODEL / EVAL_EFFORT — per-run overrides, passed as
+#                     fullsend run --runtime/--model/--effort
+#   EVAL_TIMEOUT    — runner timeout in seconds (default 1800)
+#   EVAL_FORGE      — forge passed as fullsend run --forge (default github; a
+#                     local run otherwise resolves no forge)
+#   EVAL_SANDBOX_BINARY — a specific Linux fullsend binary to copy into the
+#                     sandbox (fullsend run --fullsend-binary); unset, fullsend
+#                     picks one itself
+#   OPENAI_API_KEY  — passed through to fullsend run for the codex and pi
+#                     runtimes when set
+set -euo pipefail
+
+AGENT="${1:?agent name required}"
+# $2 is the workspace path (passed by harness, unused here)
+OUTPUT_DIR="${3:?output dir required}"
+
+FULLSEND_DIR="$(cd "${FULLSEND_DIR:?FULLSEND_DIR is required}" && pwd)"
+FIXTURE_URL="${FIXTURE_URL:?FIXTURE_URL is required (set by before_each hook)}"
+FIXTURE_TYPE="${FIXTURE_TYPE:?FIXTURE_TYPE is required (set by before_each hook)}"
+
+# Clone the ephemeral repo as the target for fullsend run.
+# The hook already created it and pushed content.
+#
+# Layout mirrors GHA for code/fix: harness expands
+# TARGET_REPO_DIR=${GITHUB_WORKSPACE}/target-repo for post-scripts.
+EPHEMERAL_REPO="${EPHEMERAL_REPO:?EPHEMERAL_REPO is required}"
+FIXTURE_NUMBER="${FIXTURE_NUMBER:?FIXTURE_NUMBER is required (set by before_each hook)}"
+
+# Shape checks for fixture-derived values — before clone / dotenv writes.
+if [[ ! "$FIXTURE_URL" =~ ^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/(issues|pull)/[0-9]+$ ]]; then
+  echo "ERROR: FIXTURE_URL has unexpected shape: ${FIXTURE_URL}" >&2
+  exit 1
+fi
+if [[ ! "$FIXTURE_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: FIXTURE_NUMBER must be a positive integer, got: ${FIXTURE_NUMBER}" >&2
+  exit 1
+fi
+if [[ ! "$EPHEMERAL_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+  echo "ERROR: EPHEMERAL_REPO must be owner/repo, got: ${EPHEMERAL_REPO}" >&2
+  exit 1
+fi
+
+EVAL_GH_WORKSPACE=$(mktemp -d)
+TARGET_DIR="${EVAL_GH_WORKSPACE}/target-repo"
+# Username comes from the helper; URL userinfo is lost when curl strips it from the effective URL.
+GH_CRED_HELPER='!f(){ echo "username=x-access-token"; echo "password=${GH_TOKEN}"; };f'
+# GitHub occasionally resets the connection mid-clone (curl 56); retry.
+cloned=0
+for attempt in 1 2 3; do
+  rm -rf "$TARGET_DIR"
+  if git -c "credential.helper=${GH_CRED_HELPER}" \
+       clone "https://github.com/${EPHEMERAL_REPO}.git" "$TARGET_DIR"; then
+    cloned=1; break
+  fi
+  if [[ $attempt -lt 3 ]]; then
+    echo "WARNING: clone attempt ${attempt} failed; retrying in $((attempt * 10))s" >&2
+    sleep $((attempt * 10))
+  fi
+done
+if [[ $cloned -ne 1 ]]; then
+  echo "ERROR: could not clone ${EPHEMERAL_REPO} after 3 attempts" >&2
+  exit 1
+fi
+git -C "$TARGET_DIR" config credential.helper "${GH_CRED_HELPER}"
+
+# Fix must run on the PR's actual head branch (post-script pushes
+# `git branch --show-current`). A local alias like eval-pr-head would push a
+# *new* remote branch and leave the PR head unchanged — failing new_commit.
+# Do not switch other PR-fixture agents (e.g. review) off main.
+if [[ "$AGENT" == "fix" && "$FIXTURE_TYPE" == "pull_request" ]]; then
+  HEAD_REF=""
+  for attempt in 1 2 3; do
+    if [[ $attempt -lt 3 ]]; then
+      # Suppress stderr on early attempts (expected to be noisy/flaky);
+      # let the final attempt's stderr through so the real gh error is
+      # visible in logs instead of being swallowed entirely.
+      if HEAD_REF=$(gh pr view "$FIXTURE_NUMBER" --repo "$EPHEMERAL_REPO" \
+        --json headRefName --jq '.headRefName' 2>/dev/null); then
+        break
+      fi
+      sleep $((attempt))
+    elif HEAD_REF=$(gh pr view "$FIXTURE_NUMBER" --repo "$EPHEMERAL_REPO" \
+      --json headRefName --jq '.headRefName'); then
+      break
+    fi
+  done
+  if [[ -z "$HEAD_REF" ]]; then
+    echo "ERROR: gh pr view failed for headRefName after retries (PR #${FIXTURE_NUMBER}); see gh error above" >&2
+    exit 1
+  fi
+  if [[ ! "$HEAD_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    echo "ERROR: unexpected PR head ref: ${HEAD_REF}" >&2
+    exit 1
+  fi
+  git -C "$TARGET_DIR" fetch origin "pull/${FIXTURE_NUMBER}/head:${HEAD_REF}"
+  git -C "$TARGET_DIR" checkout "$HEAD_REF"
+fi
+PRE_AGENT_HEAD="$(git -C "$TARGET_DIR" rev-parse HEAD)"
+export PRE_AGENT_HEAD
+
+REVIEW_BODY_FILE=""
+METRICS_TMP=""
+cleanup() {
+  # Best-effort temp-file removal only — must not override the script's real
+  # exit code. In bash, an EXIT trap's return status replaces an already-
+  # issued `exit "$rc"` when the trap's last command is false. The METRICS_TMP
+  # check below is false on nearly every real invocation (empty, or already
+  # mv'd into place), so without a trailing `true` a successful run reports
+  # exit 1 to the harness.
+  # shellcheck disable=SC2317 # invoked indirectly via trap
+  [[ -n "${ENV_FILE:-}" ]] && rm -f "$ENV_FILE"
+  # shellcheck disable=SC2317
+  [[ -n "${REVIEW_BODY_FILE:-}" && -f "${REVIEW_BODY_FILE:-}" ]] && rm -f "$REVIEW_BODY_FILE"
+  # shellcheck disable=SC2317
+  [[ -n "${EVAL_GH_WORKSPACE:-}" && -d "${EVAL_GH_WORKSPACE:-}" ]] && rm -rf "$EVAL_GH_WORKSPACE"
+  # shellcheck disable=SC2317
+  [[ -n "${METRICS_TMP:-}" && -f "${METRICS_TMP:-}" ]] && rm -f "$METRICS_TMP"
+  # shellcheck disable=SC2317
+  true
+}
+trap cleanup EXIT
+
+# Reject newline/CR injection into the dotenv file (defense in depth).
+# Values today come from gh/mktemp; still validate shape before writing.
+# Quote values so envfile.go does not treat " #" as an inline comment
+# (unquoted values strip from space-hash onward).
+#
+# Dotenv format contract: NAME="value" lines, one per line, consumed by
+# fullsend's Go dotenv parser via --env-file (internal/envfile/envfile.go) —
+# NOT sourced by any shell. That parser does NOT support escape sequences
+# (its own doc comment: "Not supported: ... escape sequences"); quote
+# handling is a byte-literal scan for the first matching quote with zero
+# backslash-awareness. Escaping " / $ / ` here would either truncate the
+# value at the first \" (parser stops at the first " byte) or leave a
+# literal stray backslash in the value the agent receives. Fail closed on
+# the wrapping quote character instead, and pass every other byte through
+# unchanged — including $ and backtick, which the parser treats as
+# ordinary characters inside a quoted value.
+emit_env() {
+  local name="$1" value="$2"
+  if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "ERROR: invalid env name: ${name}" >&2
+    exit 1
+  fi
+  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* ]]; then
+    echo "ERROR: env value for ${name} contains a newline" >&2
+    exit 1
+  fi
+  # Fail closed: the parser can't represent a " inside a "-quoted value.
+  if [[ "$value" == *\"* ]]; then
+    echo "ERROR: env value for ${name} contains a double-quote; envfile.go has no escape sequences" >&2
+    exit 1
+  fi
+  printf '%s="%s"\n' "$name" "$value"
+}
+
+# Build env file for fullsend run
+ENV_FILE="${OUTPUT_DIR}/.eval-env"
+install -m 0600 /dev/null "$ENV_FILE"
+{
+  emit_env "GH_TOKEN" "${GH_TOKEN}"
+  emit_env "PUSH_TOKEN" "${GH_TOKEN}"
+  emit_env "REVIEW_TOKEN" "${GH_TOKEN}"
+
+  # Code/fix harness env.runner refs — mint normally sets these; eval skips mint.
+  # Only override GITHUB_WORKSPACE for agents whose post-scripts expand
+  # TARGET_REPO_DIR=${GITHUB_WORKSPACE}/target-repo (triage reads config.yaml
+  # from the real Actions workspace and must not be redirected to the temp clone).
+  case "$AGENT" in
+    code|fix)
+      emit_env "PUSH_TOKEN_SOURCE" "eval"
+      # Empty matches production reusable-code.yml: post-code.sh treats unset/empty
+      # as fallback to the repo default branch (not "allow all"; use * for any).
+      emit_env "CODE_ALLOWED_TARGET_BRANCHES" ""
+      emit_env "GITHUB_WORKSPACE" "${EVAL_GH_WORKSPACE}"
+      emit_env "TARGET_REPO_DIR" "${TARGET_DIR}"
+      emit_env "GIT_BOT_EMAIL" "fullsend-eval[bot]@users.noreply.github.com"
+      ;;
+  esac
+
+  case "$FIXTURE_TYPE" in
+    issue)
+      emit_env "GITHUB_ISSUE_URL" "${FIXTURE_URL}"
+      # Code (and other issue-driven agents) require these explicitly;
+      # triage derives them from ISSUE_URL (mapped from GITHUB_ISSUE_URL
+      # by the harness forge section).
+      emit_env "ISSUE_NUMBER" "${FIXTURE_NUMBER}"
+      emit_env "REPO_FULL_NAME" "${EPHEMERAL_REPO}"
+      ;;
+    pull_request)
+      emit_env "GITHUB_PR_URL" "${FIXTURE_URL}"
+      emit_env "PR_NUMBER" "${FIXTURE_NUMBER}"
+      emit_env "REPO_FULL_NAME" "${EPHEMERAL_REPO}"
+      ;;
+  esac
+
+  if [[ "$AGENT" == "fix" ]]; then
+    # HUMAN_INSTRUCTION comes from case input.yaml via setup-fixture hook-outputs.
+    # TRIGGER_SOURCE / FIX_ITERATION / TARGET_BRANCH below are hardcoded for the
+    # v1 human /fs-fix scenario; move them into case input.yaml (like
+    # human_instruction) if/when a second fix scenario needs different values.
+    if [[ -z "${HUMAN_INSTRUCTION:-}" ]]; then
+      echo "ERROR: HUMAN_INSTRUCTION is required for fix eval (set human_instruction in input.yaml)" >&2
+      exit 1
+    fi
+    # mktemp already creates an empty file (human /fs-fix path; no review body).
+    REVIEW_BODY_FILE="$(mktemp)"
+    emit_env "TRIGGER_SOURCE" "eval-human"
+    emit_env "HUMAN_INSTRUCTION" "${HUMAN_INSTRUCTION}"
+    emit_env "FIX_ITERATION" "1"
+    emit_env "TARGET_BRANCH" "main"
+    emit_env "PRE_AGENT_HEAD" "${PRE_AGENT_HEAD}"
+    emit_env "REVIEW_BODY_FILE" "${REVIEW_BODY_FILE}"
+  fi
+
+  if [[ "$AGENT" == "retro" ]]; then
+    emit_env "ORIGINATING_URL" "${FIXTURE_URL}"
+    emit_env "RETRO_COMMENT" "${RETRO_COMMENT:-}"
+  fi
+
+  # Review agent: both REVIEW_PROTECTED_PATHS and
+  # REVIEW_FINDING_SEVERITY_THRESHOLD are literal defaults baked into
+  # harness/review.yaml's env.runner/env.sandbox stanzas. Default here to
+  # the same value ("low") so eval cases that don't set this var don't
+  # fail closed in post-review.sh's severity-validation block.
+  if [[ "$AGENT" == "review" ]]; then
+    # The production workflow supplies this computed per-repo value. Eval
+    # bypasses that workflow, so mirror its default while preserving overrides.
+    emit_env "FULLSEND_APP_SET" "${FULLSEND_APP_SET:-fullsend-ai}"
+    emit_env "REVIEW_FINDING_SEVERITY_THRESHOLD" "${REVIEW_FINDING_SEVERITY_THRESHOLD:-low}"
+    emit_env "PRIOR_REVIEW_FILE" "${PRIOR_REVIEW_FILE:-}"
+    emit_env "PRIOR_REVIEW_SHA" "${PRIOR_REVIEW_SHA:-}"
+    emit_env "PRIOR_REVIEW_PROVENANCE" "${PRIOR_REVIEW_PROVENANCE:-}"
+  fi
+
+  # OpenAI key for the pi/codex runtimes. fullsend keeps it on the runner and
+  # hands the sandbox a placeholder (ADR 0092); it never enters the sandbox.
+  [[ -n "${OPENAI_API_KEY:-}" ]] && emit_env "OPENAI_API_KEY" "${OPENAI_API_KEY}"
+  [[ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]] && emit_env "ANTHROPIC_VERTEX_PROJECT_ID" "${ANTHROPIC_VERTEX_PROJECT_ID}"
+  [[ -n "${GOOGLE_CLOUD_PROJECT:-}" ]]        && emit_env "GOOGLE_CLOUD_PROJECT" "${GOOGLE_CLOUD_PROJECT}"
+  [[ -n "${CLOUD_ML_REGION:-}" ]]             && emit_env "CLOUD_ML_REGION" "${CLOUD_ML_REGION}"
+  [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && emit_env "GOOGLE_APPLICATION_CREDENTIALS" "${GOOGLE_APPLICATION_CREDENTIALS}"
+} > "$ENV_FILE"
+
+EVAL_TIMEOUT="${EVAL_TIMEOUT:-1800}"
+
+mkdir -p "$OUTPUT_DIR"
+printf '%s\n' "$PRE_AGENT_HEAD" > "${OUTPUT_DIR}/pre-agent-head.txt"
+
+# Per-run overrides (EVAL_RUNTIME / EVAL_MODEL / EVAL_EFFORT from
+# run-functional.sh) become explicit fullsend run flags so the choice shows
+# up in the run plan, metrics.json (requested_*) and the logs.
+override_args=()
+[[ -n "${EVAL_RUNTIME:-}" ]] && override_args+=(--runtime "$EVAL_RUNTIME")
+[[ -n "${EVAL_MODEL:-}" ]] && override_args+=(--model "$EVAL_MODEL")
+[[ -n "${EVAL_EFFORT:-}" ]] && override_args+=(--effort "$EVAL_EFFORT")
+# fullsend picks the binary it copies into the sandbox: its own executable on
+# Linux, and on another OS a Linux build it fetches or makes. Passing
+# --fullsend-binary switches that off, so pass it only when the caller names
+# a specific binary with EVAL_SANDBOX_BINARY.
+[[ -n "${EVAL_SANDBOX_BINARY:-}" ]] && override_args+=(--fullsend-binary "$EVAL_SANDBOX_BINARY")
+
+# Forge detection falls back to CI env vars (GITHUB_ACTIONS/GITLAB_CI), so a
+# local run resolves no forge and pre-code.sh fails on an empty
+# FULLSEND_FORGE. Pass it explicitly; --forge takes precedence everywhere.
+EVAL_FORGE="${EVAL_FORGE:-github}"
+
+rc=0
+timeout "$EVAL_TIMEOUT" fullsend run "$AGENT" \
+  --forge "$EVAL_FORGE" \
+  --fullsend-dir "${FULLSEND_DIR}" \
+  --target-repo "$TARGET_DIR" \
+  --env-file "$ENV_FILE" \
+  --output-dir "$OUTPUT_DIR" \
+  "${override_args[@]+"${override_args[@]}"}" \
+  || rc=$?
+
+if [[ $rc -ne 0 ]]; then
+  echo "WARNING: fullsend run exited with status $rc" >&2
+fi
+
+# Remove env file to prevent secrets from being uploaded as artifacts
+rm -f "$ENV_FILE"
+
+# Copy metrics.json to the output root so score.py can find it.
+# OUTPUT_DIR is {output_dir} from the harness, which is workspace/output.
+# score.py loads files relative to case_dir/output, so metrics.json needs
+# to be at OUTPUT_DIR/metrics.json (not OUTPUT_DIR/output/metrics.json).
+METRICS_FILE=$(find "$OUTPUT_DIR" -maxdepth 3 -name metrics.json -not -path "$OUTPUT_DIR/metrics.json" 2>/dev/null | head -1)
+if [[ -n "$METRICS_FILE" ]]; then
+  cp "$METRICS_FILE" "$OUTPUT_DIR/metrics.json"
+  # agent-eval-harness's cli_runner.py reads a `cost_usd` key, but fullsend
+  # writes `total_cost_usd` (internal/cli/run.go's aggregateMetrics struct,
+  # written by writeMetricsJSON). Without this alias the harness silently
+  # reports $0.00 cost even when the run incurred real spend. Alias rather
+  # than rename so metrics.json still matches fullsend's own documented
+  # schema.
+  #
+  # mktemp/jq/mv are chained through the if-condition (not run as bare
+  # statements) so a failure here — e.g. /tmp unwritable, disk full, a
+  # cross-filesystem mv — only warns instead of tripping set -e and turning
+  # an otherwise-successful run (rc=0, PR created) into a reported failure.
+  if ! METRICS_TMP=$(mktemp); then
+    echo "WARNING: mktemp failed; skipping cost_usd alias" >&2
+  elif jq '.cost_usd = (.cost_usd // .total_cost_usd // 0)' \
+    "$OUTPUT_DIR/metrics.json" > "$METRICS_TMP"; then
+    mv "$METRICS_TMP" "$OUTPUT_DIR/metrics.json" \
+      || echo "WARNING: failed to install aliased metrics.json" >&2
+  else
+    echo "WARNING: failed to alias cost_usd in metrics.json; harness may report \$0.00 cost" >&2
+    rm -f "$METRICS_TMP"
+  fi
+  echo "Copied metrics -> $OUTPUT_DIR/metrics.json"
+fi
+
+exit "$rc"

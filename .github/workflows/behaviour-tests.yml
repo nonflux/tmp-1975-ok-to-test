@@ -1,0 +1,199 @@
+name: Behaviour Tests
+# Same-repo PRs run on pull_request (dev-environment secrets available; the
+# gate runs on the base checkout before this job checks out and executes the
+# PR head). Fork PRs get no secrets on pull_request: behaviour skips until a
+# writer comments `/ok-to-test <sha>`, and ok-to-test.yml calls this workflow
+# for that sha (event_name issue_comment, inputs.head_sha). No
+# pull_request_target: GitHub blocks it by default from 2026-12-02 (#1975).
+permissions: {}
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'agents/**'
+      - 'behaviour/**'
+      - 'config.yaml'
+      - 'env/**'
+      - 'harness/**'
+      - 'policies/**'
+      - 'schemas/**'
+      - 'scripts/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - '.github/workflows/behaviour-tests.yml'
+      - '.github/actions/check-e2e-authorization/**'
+      - '.github/scripts/check-e2e-authorization.sh'
+  pull_request:
+    # Fork PRs: /ok-to-test is handled by ok-to-test.yml via workflow_call.
+    types: [opened, synchronize, reopened]
+  merge_group:
+  workflow_dispatch:
+  workflow_call:
+    # Only ok-to-test.yml calls this, from an authorized /ok-to-test comment.
+    inputs:
+      pr_number:
+        description: Pull request number the /ok-to-test comment authorized
+        type: string
+        required: true
+      head_sha:
+        description: PR head sha the /ok-to-test comment authorized (checked out by behaviour)
+        type: string
+        required: true
+    outputs:
+      result:
+        description: behaviour job status (success, failure or cancelled)
+        value: ${{ jobs.behaviour.outputs.result }}
+# /ok-to-test runs get their own group: in a called workflow github.workflow
+# is the caller's name, shared with the functional-tests.yml call. They are
+# never cancelled; the caller reports their result.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request'
+
+        && format('behaviour-{0}', github.event.pull_request.number)
+        || github.event_name == 'issue_comment'
+        && format('behaviour-ok-to-test-{0}', inputs.pr_number)
+        || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request'
+
+        || (github.event_name != 'issue_comment' && github.ref != 'refs/heads/main') }}
+jobs:
+  gate:
+    # Same-repo PRs only (gh-aw's guard): a fork PR's pull_request token is
+    # read-only and it gets no secrets, so forks go through /ok-to-test.
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.head.repo.id == github.repository_id
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      authorized: ${{ steps.auth.outputs.authorized }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }} # Base only — never check out PR head in gate
+          persist-credentials: false
+      - name: Check PR authorization
+        id: auth
+        uses: ./.github/actions/check-e2e-authorization
+        with:
+          pr_number: ${{ github.event.pull_request.number }}
+          repository: ${{ github.repository }}
+          pr_updated_at: ${{ github.event.pull_request.updated_at }}
+          event_action: ${{ github.event.action }}
+          pr_author_association: ${{ github.event.pull_request.author_association }}
+          pr_author_login: ${{ github.event.pull_request.user.login }}
+          label_actor_login: ${{ github.event.sender.login }}
+  behaviour:
+    needs: gate
+    if: >-
+      !cancelled() && github.repository_owner == 'nonflux' && (
+
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        github.event_name == 'merge_group' ||
+        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'pull_request' &&
+         needs.gate.outputs.authorized == 'true') ||
+        (github.event_name == 'issue_comment' && inputs.head_sha != '')
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENVIRONMENT: dev
+      BEHAVIOUR_SCM: github
+      BEHAVIOUR_CI: githubactions
+      BEHAVIOUR_INSTALL_MODE: per-repo
+      BEHAVIOUR_APP_SET: fullsend-test
+      BEHAVIOUR_SUITE_NAME: agents-bt
+    outputs:
+      result: ${{ steps.result.outputs.result }}
+    steps:
+      - name: Check for behaviour-relevant changes
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          # /ok-to-test runs: diff the authorized sha, not whatever the PR head is now.
+          HEAD_SHA: ${{ inputs.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$EVENT_NAME" in
+            pull_request)
+              if ! files="$(gh api --paginate \
+                "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+                --jq '.[].filename')"; then
+                echo '::warning::could not inspect pull request files; running behaviour tests'
+                echo 'relevant=true' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            merge_group|issue_comment)
+              if [[ "$EVENT_NAME" == merge_group ]]; then
+                range="${MERGE_GROUP_BASE_SHA}...${MERGE_GROUP_HEAD_SHA}"
+              else
+                range="${DEFAULT_BRANCH}...${HEAD_SHA}"
+              fi
+              if ! files="$(gh api \
+                "repos/${REPOSITORY}/compare/${range}" \
+                --jq '.files[].filename')"; then
+                echo "::warning::could not inspect ${EVENT_NAME} files; running behaviour tests"
+                echo 'relevant=true' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              ;;
+            *)
+              exit 0
+              ;;
+          esac
+
+          file_count="$(printf '%s\n' "$files" | sed '/^$/d' | wc -l)"
+          if (( file_count >= 300 )); then
+            echo '::warning::change list is truncated or large; running behaviour tests'
+            echo 'relevant=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          relevant=false
+          while IFS= read -r path; do
+            case "$path" in
+              agents/*|behaviour/*|config.yaml|env/*|harness/*|policies/*|schemas/*|scripts/*|go.mod|go.sum|Makefile|.fullsend/*|.github/workflows/behaviour-tests.yml|.github/actions/check-e2e-authorization/*|.github/scripts/check-e2e-authorization.sh)
+                relevant=true
+                break
+                ;;
+            esac
+          done <<< "$files"
+          echo "relevant=${relevant}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.changes.outputs.relevant != 'false'
+        with:
+          ref: >-
+            ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha
+
+                || github.event_name == 'issue_comment' && inputs.head_sha
+                || github.sha }}
+          persist-credentials: false
+          # Fork code only after a writer's /ok-to-test for this exact sha.
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'issue_comment' }}
+      - name: Stub suite
+        if: steps.changes.outputs.relevant != 'false'
+        run: echo "behaviour ran on $(git rev-parse HEAD)"
+      - name: Record result
+        id: result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: echo "result=${JOB_STATUS}" >> "$GITHUB_OUTPUT"
